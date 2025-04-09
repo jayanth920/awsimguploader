@@ -3,21 +3,22 @@ import boto3
 import base64
 import io
 from PIL import Image
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
+import re
 
 s3 = boto3.client("s3")
 glacier = boto3.client("s3")
-textract = boto3.client("textract")  # Add Textract client
+textract = boto3.client("textract")
+
+dynamodb = boto3.resource("dynamodb")
+DYNAMO_TABLE = "jay-batch-table"
+table = dynamodb.Table(DYNAMO_TABLE)
 
 S3_BUCKET = "jay-img-bucket"
 GLACIER_BUCKET = "jay-glacier-bucket"
 
-
 BATCH_SIZE = 2
-DYNAMO_TABLE = "jay-batch-table"
-dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(DYNAMO_TABLE)
 
 def lambda_handler(event, context):
     try:
@@ -31,7 +32,7 @@ def lambda_handler(event, context):
             return response(400, {"error": f"Max batch size is {BATCH_SIZE}."})
 
         # Generate batch name
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         timestamp = now.strftime("%m/%d/%y-%H-%M-%S")
         batch_id = str(uuid.uuid4())[:8]  # Short unique id
         batch_name = f"Batch {batch_id} - {timestamp}"
@@ -65,7 +66,8 @@ def lambda_handler(event, context):
                 except:
                     extracted_text = "null"
 
-            extracted_addresses.append(extracted_text)
+            clean_address = extract_address_from_text(extracted_text)
+            extracted_addresses.append(clean_address)
 
             # Compress and store in Glacier
             try:
@@ -77,6 +79,7 @@ def lambda_handler(event, context):
 
         # Store batch record in DynamoDB
         item = {
+            "id": str(uuid.uuid4()),
             "batch_name": batch_name,
             "addresses": extracted_addresses
         }
@@ -90,17 +93,16 @@ def lambda_handler(event, context):
     except Exception as e:
         return response(400, {"error": f"General error: {str(e)}"})
 
-
 def upload_to_s3(image_data, s3_key):
     s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=image_data)
 
 def compress_image(image_data):
     img = Image.open(io.BytesIO(image_data))
     img = img.convert("RGB")
-    img = img.resize((img.width // 2, img.height // 2))  # Reduce size by 50%
-    
+    img = img.resize((img.width // 2, img.height // 2))
+
     compressed_byte_arr = io.BytesIO()
-    img.save(compressed_byte_arr, format="JPEG", quality=75)  # Compress with quality 75%
+    img.save(compressed_byte_arr, format="JPEG", quality=75)
     return compressed_byte_arr.getvalue()
 
 def upload_to_glacier(image_data, file_name):
@@ -113,15 +115,39 @@ def perform_ocr(s3_key):
     response = textract.detect_document_text(
         Document={"S3Object": {"Bucket": S3_BUCKET, "Name": s3_key}}
     )
-    extracted_text = " ".join([block["Text"] for block in response.get("Blocks", []) if block["BlockType"] == "LINE"])
+    # Join with newlines to preserve structure
+    extracted_text = "\n".join([
+        block["Text"] for block in response.get("Blocks", [])
+        if block["BlockType"] == "LINE"
+    ])
     return extracted_text if extracted_text else "null"
+
+def extract_address_from_text(text):
+    if not text or text == "null":
+        return "null"
+
+    # Check Apple Maps format first
+    apple_match = re.search(r'Address\s+(.*?)\s+Coordinates', text, re.DOTALL)
+    if apple_match:
+        return re.sub(r"\s+", " ", apple_match.group(1)).strip()
+
+    # Google Maps multiline format
+    gmaps_match = re.search(
+        r'(\d{1,5}.*?,\s*.*?,?\s*\n?\s*[A-Z]{2}\s*\d{5})',
+        text,
+        re.MULTILINE
+    )
+    if gmaps_match:
+        # Clean up any newlines/extra spaces
+        return re.sub(r"\s+", " ", gmaps_match.group(1)).strip()
+
+    return "null"
 
 def delete_prefix(bucket, prefix):
     objects = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
     if "Contents" in objects:
         for obj in objects["Contents"]:
             s3.delete_object(Bucket=bucket, Key=obj["Key"])
-
 
 def response(status_code, body):
     return {
@@ -133,4 +159,3 @@ def response(status_code, body):
         },
         "body": json.dumps(body)
     }
-

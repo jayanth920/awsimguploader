@@ -5,10 +5,13 @@ from PIL import Image
 from datetime import datetime, timezone
 import uuid
 from pymongo import MongoClient
+import re
+
 
 # MongoDB connection
 client = MongoClient(
-    "")
+    "mongodb+srv://ejdeveloperd:Incorrect99@cluster0.1bfqxle.mongodb.net/ocr_results?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
+)
 db = client["ocr_results"]  # Database name
 collection = db["batches"]  # Collection name
 
@@ -70,7 +73,9 @@ def lambda_handler(event, context):
                 except:
                     extracted_text = "null"
 
-            extracted_addresses.append(extracted_text)
+            # extracted_addresses.append(extracted_text)
+            clean_address = extract_address_from_text(extracted_text)
+            extracted_addresses.append(clean_address)
 
             # Compress and store in Glacier
             try:
@@ -127,21 +132,40 @@ def perform_ocr(s3_key):
     response = textract.detect_document_text(
         Document={"S3Object": {"Bucket": S3_BUCKET, "Name": s3_key}}
     )
-    extracted_text = " ".join(
-        [
-            block["Text"]
-            for block in response.get("Blocks", [])
-            if block["BlockType"] == "LINE"
-        ]
-    )
+    # Join with newlines to preserve structure
+    extracted_text = "\n".join([
+        block["Text"] for block in response.get("Blocks", [])
+        if block["BlockType"] == "LINE"
+    ])
     return extracted_text if extracted_text else "null"
 
+def extract_address_from_text(text):
+    if not text or text == "null":
+        return "null"
+
+    # Check Apple Maps format first
+    apple_match = re.search(r'Address\s+(.*?)\s+Coordinates', text, re.DOTALL)
+    if apple_match:
+        return re.sub(r"\s+", " ", apple_match.group(1)).strip()
+
+    # Google Maps multiline format
+    gmaps_match = re.search(
+        r'(\d{1,5}.*?,\s*.*?,?\s*\n?\s*[A-Z]{2}\s*\d{5})',
+        text,
+        re.MULTILINE
+    )
+    if gmaps_match:
+        # Clean up any newlines/extra spaces
+        return re.sub(r"\s+", " ", gmaps_match.group(1)).strip()
+
+    return "null"
 
 def delete_prefix(bucket, prefix):
     objects = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
     if "Contents" in objects:
         for obj in objects["Contents"]:
             s3.delete_object(Bucket=bucket, Key=obj["Key"])
+
 
 
 def response(status_code, body):
@@ -154,4 +178,3 @@ def response(status_code, body):
         },
         "body": json.dumps(body),
     }
-
